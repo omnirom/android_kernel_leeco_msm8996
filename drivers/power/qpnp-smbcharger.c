@@ -39,6 +39,7 @@
 #include <linux/msm_bcl.h>
 #include <linux/ktime.h>
 #include "pmic-voter.h"
+#include <linux/power/mhl_uevent.h>
 
 /* Mask/Bit helpers */
 #define _SMB_MASK(BITS, POS) \
@@ -257,6 +258,7 @@ struct smbchg_chip {
 	/* aicl deglitch workaround */
 	unsigned long			first_aicl_seconds;
 	int				aicl_irq_count;
+	int                             mhl_wihd;
 	struct mutex			usb_status_lock;
 	bool				hvdcp_3_det_ignore_uv;
 	struct completion		src_det_lowered;
@@ -331,10 +333,17 @@ enum wake_reason {
 	PM_DETECT_HVDCP = BIT(4),
 };
 
+/* 1 insert mhl, 0 insert other */
+static int mhl_insert_flag;
+
 enum fcc_voters {
 	ESR_PULSE_FCC_VOTER,
 	BATT_TYPE_FCC_VOTER,
 	RESTRICTED_CHG_FCC_VOTER,
+	THERMAL_FCC_VOTER,
+#ifdef CONFIG_PRODUCT_LE_ZL1
+	JEITA_FCC_VOTER,
+#endif
 	NUM_FCC_VOTER,
 };
 
@@ -428,6 +437,15 @@ enum hvdcp_voters {
 	HVDCP_PULSING_VOTER,
 	NUM_HVDCP_VOTERS,
 };
+
+#ifdef CONFIG_PRODUCT_LE_ZL1
+enum thermal_scn {
+	THERMAL_NORMAL,
+	THERMAL_SCN,
+	THERMAL_AUTO,
+};
+#endif
+
 static int smbchg_debug_mask;
 module_param_named(
 	debug_mask, smbchg_debug_mask, int, S_IRUSR | S_IWUSR
@@ -486,6 +504,8 @@ module_param_named(
 	wipower_dcin_hyst_uv, wipower_dcin_hyst_uv,
 	int, S_IRUSR | S_IWUSR
 );
+
+static bool hvdcp_aicl_rerun = false;
 
 #define pr_smb(reason, fmt, ...)				\
 	do {							\
@@ -805,6 +825,25 @@ static bool is_otg_present(struct smbchg_chip *chip)
 #define INPUT_STS			0x0D
 #define DCIN_UV_BIT			BIT(0)
 #define DCIN_OV_BIT			BIT(1)
+/* LeTV define USB ID register offset */
+#define RID_STS				0xB
+#define RID_VALID_HIGH		0xE
+#define RID_VALID_LOW		0xF
+#define RID_INT_RT_STS		0x10
+#define R_FLOAT				0x495
+#define R_MHL				0x1A
+#define R_OTG				0x0
+
+/* Letv define RID state */
+enum rid_state {
+	RID_GROUND = 0,
+	RID_FLOAT,
+	RID_MHL,
+	RID_UNKNOW,
+};
+
+int dw3_id_state = RID_UNKNOW;
+
 static bool is_dc_present(struct smbchg_chip *chip)
 {
 	int rc;
@@ -842,6 +881,37 @@ static bool is_usb_present(struct smbchg_chip *chip)
 	}
 
 	return !!(reg & (USBIN_9V | USBIN_UNREG | USBIN_LV));
+}
+
+static int get_rid_state(struct smbchg_chip *chip)
+{
+	u8 reg_high;
+	u8 reg_low;
+	u16 rid;
+	enum rid_state rid_sts;
+	int rc;
+
+	rc = smbchg_read(chip, &reg_low,
+			chip->usb_chgpth_base + RID_VALID_LOW, 1);
+	rc = smbchg_read(chip, &reg_high,
+			chip->usb_chgpth_base + RID_VALID_HIGH, 1);
+
+	pr_info("RID_VALUE[HIGH, LOW] = [%02x, %02x]\n", reg_high, reg_low);
+	rid = (reg_high << 8) | reg_low; /* get the resistor of USBID */
+
+	if (rid > R_FLOAT)
+		rid_sts = RID_FLOAT;
+	else if (rid > R_MHL)
+		rid_sts = RID_MHL;
+	else if (rid >= R_OTG) {
+		if (is_usb_present(chip))
+			rid_sts = RID_MHL;
+		else
+			rid_sts = RID_GROUND;
+	} else
+		rid_sts = RID_UNKNOW;
+
+	return rid_sts;
 }
 
 static char *usb_type_str[] = {
@@ -1679,6 +1749,7 @@ static int smbchg_set_high_usb_chg_current(struct smbchg_chip *chip,
  *	if CDP/DCP it will look at 0x0C setting
  *		i.e. values in 0x41[1, 0] does not matter
  */
+static void smbchg_rerun_aicl(struct smbchg_chip *chip);
 static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 							int current_ma)
 {
@@ -1834,6 +1905,11 @@ static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 out:
 	pr_smb(PR_STATUS, "usb type = %d current set to %d mA\n",
 			chip->usb_supply_type, chip->usb_max_current_ma);
+
+	if (hvdcp_aicl_rerun) {
+		hvdcp_aicl_rerun = false;
+		smbchg_rerun_aicl(chip);
+	}
 	return rc;
 }
 
@@ -6657,15 +6733,44 @@ static irqreturn_t usbid_change_handler(int irq, void *_chip)
 {
 	struct smbchg_chip *chip = _chip;
 	bool otg_present;
+	enum rid_state rid_sts;
 
 	pr_smb(PR_INTERRUPT, "triggered\n");
 
-	otg_present = is_otg_present(chip);
-	if (chip->usb_psy) {
-		pr_smb(PR_MISC, "setting usb psy OTG = %d\n",
-				otg_present ? 1 : 0);
-		power_supply_set_usb_otg(chip->usb_psy, otg_present ? 1 : 0);
-	}
+	pr_err(">>> usbid change handler\n");
+	msleep(20);
+	pr_info("mhl_wihd is %s used.\n",
+			chip->mhl_wihd ? "" : "not ");
+	/*
+	 * With cc logic help, legacy OTG device is detected by cc logic as UFP device,
+	 * so we remove legacy OTG device detecting logic here
+	 */
+	if (chip->mhl_wihd) {
+		rid_sts = get_rid_state(chip);
+		if (rid_sts == RID_GROUND) {
+			pr_info("OTG detected\n");
+			msleep(20);
+			power_supply_set_usb_otg(chip->usb_psy, 1);
+		} else if (rid_sts == RID_MHL) {
+			mhl_insert_flag = 1;
+			mhl_state_uevent(R_MHL, 0);
+			pr_info("MHL detected\n");
+		} else if (rid_sts == RID_FLOAT) {
+			pr_info("plug out detected\n");
+			power_supply_set_usb_otg(chip->usb_psy, 0);
+		} else
+			pr_err("unknow rid state.\n");
+	} else {
+		dw3_id_state = get_rid_state(chip);
+		if (dw3_id_state == RID_MHL)
+			mhl_insert_flag = 1;
+		if (chip->usb_psy) {
+			otg_present = (dw3_id_state == RID_GROUND);
+			power_supply_set_usb_otg(chip->usb_psy,
+						otg_present ? 1 : 0);
+		}
+        }
+
 	if (otg_present)
 		pr_smb(PR_STATUS, "OTG detected\n");
 
@@ -6809,6 +6914,7 @@ static inline int get_bpd(const char *name)
 #define OTG_PIN_CTRL_RID_DIS		0x04
 #define OTG_CMD_CTRL_RID_EN		0x08
 #define AICL_ADC_BIT			BIT(6)
+#define AICL_INIT_BIT			BIT(7)
 static void batt_ov_wa_check(struct smbchg_chip *chip)
 {
 	int rc;
@@ -7273,6 +7379,14 @@ static int smbchg_hw_init(struct smbchg_chip *chip)
 	if (rc)
 		dev_err(chip->dev, "Couldn't switch to Syson LDO, rc=%d\n",
 			rc);
+
+	/* select digital AICL mode */
+	rc = smbchg_sec_masked_write(chip,
+		chip->misc_base + MISC_TRIM_OPT_15_8, AICL_INIT_BIT, 0);
+	if (rc)
+		pr_err("Couldn't write to MISC_TRIM_OPTIONS_15_8 rc=%d\n",
+			rc);
+
 	return rc;
 }
 
@@ -7405,6 +7519,9 @@ static int smb_parse_dt(struct smbchg_chip *chip)
 	int rc = 0, ocp_thresh = -EINVAL;
 	struct device_node *node = chip->dev->of_node;
 	const char *dc_psy_type, *bpd;
+
+	int hvdcp3_icl_ma = 0;
+	int hvdcp_icl_ma = 0;
 
 	if (!node) {
 		dev_err(chip->dev, "device tree info. missing\n");
@@ -7587,6 +7704,21 @@ static int smb_parse_dt(struct smbchg_chip *chip)
 				"Couldn't read threm limits rc = %d\n", rc);
 			return rc;
 		}
+
+		chip->therm_lvl_sel = 0;
+
+		if (of_find_property(node, "qcom,hvdcp3_icl_ma",NULL)){
+			OF_PROP_READ(chip,hvdcp3_icl_ma,"hvdcp3_icl_ma",rc,1);
+			if(hvdcp3_icl_ma > 0)  smbchg_default_hvdcp3_icl_ma = hvdcp3_icl_ma;
+		}
+
+		if (of_find_property(node, "qcom,hvdcp-icl-ma",NULL)){
+			OF_PROP_READ(chip,hvdcp_icl_ma,"hvdcp-icl-ma",rc,1);
+			if(hvdcp_icl_ma > 0) {
+				smbchg_default_hvdcp_icl_ma = hvdcp_icl_ma;
+			}
+		}
+
 	}
 
 	chip->skip_usb_notification
@@ -8059,6 +8191,8 @@ static int smbchg_probe(struct spmi_device *spmi)
 	struct power_supply *usb_psy, *typec_psy = NULL;
 	struct qpnp_vadc_chip *vadc_dev = NULL, *vchg_vadc_dev = NULL;
 	const char *typec_psy_name;
+	/* LeTV init MHL kobject */
+	mhl_kobj_init();
 
 	usb_psy = power_supply_get_by_name("usb");
 	if (!usb_psy) {
@@ -8118,6 +8252,12 @@ static int smbchg_probe(struct spmi_device *spmi)
 			set_fastchg_current_vote_cb);
 	if (IS_ERR(chip->fcc_votable))
 		return PTR_ERR(chip->fcc_votable);
+	rc = of_property_read_u32(spmi->dev.of_node,
+					"qcom,mhl-wihd", &(chip->mhl_wihd));
+	if(rc)
+	{
+		chip->mhl_wihd = 0;
+	}
 
 	chip->usb_icl_votable = create_votable(&spmi->dev,
 			"SMBCHG: usb_icl",
@@ -8354,6 +8494,8 @@ static int smbchg_remove(struct spmi_device *spmi)
 
 	power_supply_unregister(&chip->batt_psy);
 
+	/* LeTV free MHL kobject */
+	mhl_kobj_exit();
 	return 0;
 }
 
