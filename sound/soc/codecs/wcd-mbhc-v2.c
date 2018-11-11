@@ -1267,7 +1267,6 @@ static void wcd_correct_swch_plug(struct work_struct *work)
 		reinit_completion(&mbhc->btn_press_compl);
 		goto exit;
 	}
-restart_correct_detect:
 #endif
 	/*
 	 * Enable micbias/pullup for detection in correct work.
