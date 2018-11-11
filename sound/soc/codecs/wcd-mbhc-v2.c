@@ -1225,6 +1225,9 @@ exit:
 	return spl_hs;
 }
 
+static int disable_hp_detect __read_mostly;
+module_param(disable_hp_detect, int, 0664);
+
 static void wcd_correct_swch_plug(struct work_struct *work)
 {
 	struct wcd_mbhc *mbhc;
@@ -1256,6 +1259,16 @@ static void wcd_correct_swch_plug(struct work_struct *work)
 	mbhc = container_of(work, struct wcd_mbhc, correct_plug_swch);
 	codec = mbhc->codec;
 
+
+#ifdef CONFIG_VENDOR_LEECO
+	if (disable_hp_detect) {
+		pr_err("%s: headset detection disabled\n", __func__);
+		mbhc->btn_press_intr = false;
+		reinit_completion(&mbhc->btn_press_compl);
+		goto exit;
+	}
+restart_correct_detect:
+#endif
 	/*
 	 * Enable micbias/pullup for detection in correct work.
 	 * This work will get scheduled from detect_plug_type which
@@ -1289,12 +1302,14 @@ static void wcd_correct_swch_plug(struct work_struct *work)
 		if (!btn_result && !hs_comp_res)
 			plug_type = MBHC_PLUG_TYPE_HEADSET;
 		else if (!btn_result && hs_comp_res)
-			plug_type = MBHC_PLUG_TYPE_HIGH_HPH;
+			plug_type = MBHC_PLUG_TYPE_HEADSET;
 		else
 			plug_type = MBHC_PLUG_TYPE_INVALID;
 	} else {
 		if (!btn_result && !hs_comp_res)
 			plug_type = MBHC_PLUG_TYPE_HEADPHONE;
+		else if (!btn_result && hs_comp_res)
+			plug_type = MBHC_PLUG_TYPE_HEADSET;
 		else
 			plug_type = MBHC_PLUG_TYPE_INVALID;
 	}
@@ -1319,7 +1334,8 @@ static void wcd_correct_swch_plug(struct work_struct *work)
 	if ((plug_type == MBHC_PLUG_TYPE_HEADSET ||
 #ifdef CONFIG_VENDOR_LEECO
 	     /* Treat hs_comp_res as a valid plug. */
-	     plug_type == MBHC_PLUG_TYPE_HIGH_HPH) &&
+	     plug_type == MBHC_PLUG_TYPE_HIGH_HPH || 
+         plug_type == MBHC_PLUG_TYPE_HEADPHONE) &&
 #else
 	     plug_type == MBHC_PLUG_TYPE_HEADPHONE) &&
 #endif
