@@ -491,8 +491,8 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 	if (cfs_rq->curr)
 		vruntime = cfs_rq->curr->vruntime;
 
-	if (cfs_rq->rb_leftmost) {
-		struct sched_entity *se = rb_entry(cfs_rq->rb_leftmost,
+	if (cfs_rq->tasks_timeline.rb_leftmost) {
+		struct sched_entity *se = rb_entry(cfs_rq->tasks_timeline.rb_leftmost,
 						   struct sched_entity,
 						   run_node);
 
@@ -515,7 +515,7 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
  */
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	struct rb_node **link = &cfs_rq->tasks_timeline.rb_node;
+	struct rb_node **link = &cfs_rq->tasks_timeline.rb_root.rb_node;
 	struct rb_node *parent = NULL;
 	struct sched_entity *entry;
 	int leftmost = 1;
@@ -543,27 +543,27 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	 * used):
 	 */
 	if (leftmost)
-		cfs_rq->rb_leftmost = &se->run_node;
+		cfs_rq->tasks_timeline.rb_leftmost = &se->run_node;
 
 	rb_link_node(&se->run_node, parent, link);
-	rb_insert_color(&se->run_node, &cfs_rq->tasks_timeline);
+	rb_insert_color(&se->run_node, &cfs_rq->tasks_timeline.rb_root);
 }
 
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	if (cfs_rq->rb_leftmost == &se->run_node) {
+	if (cfs_rq->tasks_timeline.rb_leftmost == &se->run_node) {
 		struct rb_node *next_node;
 
 		next_node = rb_next(&se->run_node);
-		cfs_rq->rb_leftmost = next_node;
+		cfs_rq->tasks_timeline.rb_leftmost = next_node;
 	}
 
-	rb_erase(&se->run_node, &cfs_rq->tasks_timeline);
+	rb_erase(&se->run_node, &cfs_rq->tasks_timeline.rb_root);
 }
 
 struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
 {
-	struct rb_node *left = cfs_rq->rb_leftmost;
+	struct rb_node *left = cfs_rq->tasks_timeline.rb_leftmost;
 
 	if (!left)
 		return NULL;
@@ -584,7 +584,7 @@ static struct sched_entity *__pick_next_entity(struct sched_entity *se)
 #ifdef CONFIG_SCHED_DEBUG
 struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
 {
-	struct rb_node *last = rb_last(&cfs_rq->tasks_timeline);
+	struct rb_node *last = rb_last(&cfs_rq->tasks_timeline.rb_root);
 
 	if (!last)
 		return NULL;
@@ -5023,14 +5023,6 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	update_stats_enqueue(cfs_rq, se, !!(flags & ENQUEUE_MIGRATING));
 	check_spread(cfs_rq, se);
-
-#ifdef CONFIG_FAIR_GROUP_SCHED
-	/*
-	 * Update depth before it can be picked as next sched entity.
-	 */
-	se->depth = se->parent ? se->parent->depth + 1 : 0;
-#endif
-
 	if (se != cfs_rq->curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
@@ -10429,7 +10421,7 @@ static void set_curr_task_fair(struct rq *rq)
 
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
-	cfs_rq->tasks_timeline = RB_ROOT;
+	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;

@@ -1,4 +1,3 @@
-
 #include <linux/sched.h>
 #include <linux/sched/sysctl.h>
 #include <linux/sched/rt.h>
@@ -338,8 +337,8 @@ struct cfs_rq {
 	u64 min_vruntime_copy;
 #endif
 
-	struct rb_root tasks_timeline;
-	struct rb_node *rb_leftmost;
+	struct rb_root_cached tasks_timeline;
+	//struct rb_node *rb_leftmost;
 
 	/*
 	 * 'curr' points to currently running entity on this cfs_rq.
@@ -904,6 +903,7 @@ extern unsigned int max_capacity;
 extern unsigned int min_capacity;
 extern unsigned int max_load_scale_factor;
 extern unsigned int max_possible_capacity;
+extern unsigned int min_max_possible_capacity;
 extern cpumask_t mpc_mask;
 extern unsigned long capacity_scale_cpu_efficiency(int cpu);
 extern unsigned long capacity_scale_cpu_freq(int cpu);
@@ -1027,8 +1027,21 @@ static inline int sched_cpu_high_irqload(int cpu)
 	return sched_irqload(cpu) >= sysctl_sched_cpu_high_irqload;
 }
 
-static inline bool hmp_capable(void) { return false; }
-static inline bool is_min_capacity_cpu(int cpu) { return true; }
+static inline int cpu_max_possible_capacity(int cpu)
+{
+	return cpu_rq(cpu)->max_possible_capacity;
+}
+
+static inline bool hmp_capable(void)
+{
+	return max_possible_capacity != min_max_possible_capacity;
+}
+
+static inline bool is_min_capacity_cpu(int cpu)
+{
+	return cpu_max_possible_capacity(cpu) == min_max_possible_capacity;
+}
+
 
 #else	/* CONFIG_SCHED_HMP */
 
@@ -1081,6 +1094,7 @@ static inline void sched_account_irqtime(int cpu, struct task_struct *curr,
 }
 
 static inline int sched_cpu_high_irqload(int cpu) { return 0; }
+
 
 #endif	/* CONFIG_SCHED_HMP */
 
@@ -1976,3 +1990,8 @@ static inline u64 irq_time_read(int cpu)
 }
 #endif /* CONFIG_64BIT */
 #endif /* CONFIG_IRQ_TIME_ACCOUNTING */
+
+/*
+ * task_may_not_preempt - check whether a task may not be preemptible soon
+ */
+extern bool task_may_not_preempt(struct task_struct *task, int cpu);

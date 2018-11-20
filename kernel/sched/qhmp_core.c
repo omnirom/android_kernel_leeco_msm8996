@@ -92,12 +92,48 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+static atomic_t __su_instances;
+
+int su_instances(void)
+{
+	return atomic_read(&__su_instances);
+}
+
+bool su_running(void)
+{
+	return su_instances() > 0;
+}
+
+bool su_visible(void)
+{
+	kuid_t uid = current_uid();
+	if (su_running())
+		return true;
+	if (uid_eq(uid, GLOBAL_ROOT_UID) || uid_eq(uid, GLOBAL_SYSTEM_UID))
+		return true;
+	return false;
+}
+
+void su_exec(void)
+{
+	atomic_inc(&__su_instances);
+}
+
+void su_exit(void)
+{
+	atomic_dec(&__su_instances);
+}
+
+
+
 const char *task_event_names[] = {"PUT_PREV_TASK", "PICK_NEXT_TASK",
 				  "TASK_WAKE", "TASK_MIGRATE", "TASK_UPDATE",
 				"IRQ_UPDATE"};
 
 ATOMIC_NOTIFIER_HEAD(migration_notifier_head);
 ATOMIC_NOTIFIER_HEAD(load_alert_notifier_head);
+
+static int kthreads_pm_level __read_mostly;
 
 void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
 {
@@ -1285,6 +1321,8 @@ unsigned int max_capacity = 1024; /* max(rq->capacity) */
 unsigned int min_capacity = 1024; /* min(rq->capacity) */
 unsigned int max_load_scale_factor = 1024; /* max possible load scale factor */
 unsigned int max_possible_capacity = 1024; /* max(rq->max_possible_capacity) */
+unsigned int min_max_possible_capacity = 1024; /* min(rq->max_possible_capacity) */
+
 
 /* Mask of all CPUs that have  max_possible_capacity */
 cpumask_t mpc_mask = CPU_MASK_ALL;
@@ -2346,8 +2384,10 @@ int sched_set_window(u64 window_start, unsigned int window_size)
 	unsigned long flags;
 
 	if (sched_use_pelt ||
-		 (window_size * TICK_NSEC <  MIN_SCHED_RAVG_WINDOW))
+		 (window_size * TICK_NSEC <  MIN_SCHED_RAVG_WINDOW)) {
+            pr_err("sched_set_window failed:%d,%d", sched_use_pelt,window_size);
 			return -EINVAL;
+    }
 
 	mutex_lock(&policy_mutex);
 
@@ -2567,7 +2607,7 @@ static int cpufreq_notifier_policy(struct notifier_block *nb,
 {
 	struct cpufreq_policy *policy = (struct cpufreq_policy *)data;
 	int i, update_max = 0;
-	u64 highest_mpc = 0, highest_mplsf = 0;
+	u64 highest_mpc = 0, highest_mplsf = 0, lowest_mpc = U64_MAX;
 	const struct cpumask *cpus = policy->related_cpus;
 	unsigned int orig_min_max_freq = min_max_freq;
 	unsigned int orig_max_possible_freq = max_possible_freq;
@@ -2660,12 +2700,17 @@ static int cpufreq_notifier_policy(struct notifier_block *nb,
 
 			if (mplsf > highest_mplsf)
 				highest_mplsf = mplsf;
+
+    		if (mpc < lowest_mpc)
+	    		lowest_mpc = mpc;
+
 		}
 	}
 
 	if (update_max) {
 		max_possible_capacity = highest_mpc;
 		max_load_scale_factor = highest_mplsf;
+    	min_max_possible_capacity = lowest_mpc;
 	}
 
 	__update_min_max_capacity();
@@ -2814,7 +2859,7 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
 		p->se.nr_migrations++;
-		perf_sw_event(PERF_COUNT_SW_CPU_MIGRATIONS, 1, NULL, 0);
+		perf_sw_event_sched(PERF_COUNT_SW_CPU_MIGRATIONS, 1, 0);
 
 		fixup_busy_time(p, new_cpu);
 	}
@@ -6563,8 +6608,52 @@ static struct rq *move_queued_task(struct task_struct *p, int new_cpu)
 	return rq;
 }
 
+static void get_adjusted_cpumask(const struct task_struct *p,
+	struct cpumask *new_mask, const struct cpumask *old_mask)
+{
+	/* Force all unbound kthreads onto the little cluster */
+
+/*
+	unsigned long little_cluster_cpus = 0xF;
+    bool non_kernel = false;
+    bool dex2oat = !memcmp(p->comm, "dex", sizeof("dex"));
+
+    if( kthreads_pm_level == 0 ) {
+        little_cluster_cpus = 0xF;
+        non_kernel = false;
+    } else if( kthreads_pm_level == 1 ) {
+        little_cluster_cpus = 0x3;
+        non_kernel = false;
+    } else if( kthreads_pm_level == 2 ) {
+        little_cluster_cpus = 0x1;
+        non_kernel = false;
+    } else if( kthreads_pm_level == 3 ) {
+        little_cluster_cpus = 0x3;
+        non_kernel = true;
+    } else if( kthreads_pm_level == 4 ) {
+        little_cluster_cpus = 0x1;
+        non_kernel = true;
+    } else {
+        little_cluster_cpus = 0xF;
+        non_kernel = false;
+    }
+
+
+	if ( ((p->flags & PF_KTHREAD) || non_kernel) && !dex2oat && p->pid != 1 && cpumask_weight(old_mask) > 1)
+		cpumask_copy(new_mask, to_cpumask(&little_cluster_cpus));
+	else
+*/
+		cpumask_copy(new_mask, old_mask);
+}
+
 void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 {
+
+    cpumask_t adjusted_mask;
+
+	get_adjusted_cpumask(p, &adjusted_mask, new_mask);
+	new_mask = &adjusted_mask;
+
 	if (p->sched_class && p->sched_class->set_cpus_allowed)
 		p->sched_class->set_cpus_allowed(p, new_mask);
 
@@ -6601,6 +6690,10 @@ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
 	struct rq *rq;
 	unsigned int dest_cpu;
 	int ret = 0;
+    cpumask_t adjusted_mask;
+
+	get_adjusted_cpumask(p, &adjusted_mask, new_mask);
+	new_mask = &adjusted_mask;
 
 	rq = task_rq_lock(p, &flags);
 
@@ -10308,3 +10401,5 @@ void dump_cpu_task(int cpu)
 	pr_info("Task dump for CPU %d:\n", cpu);
 	sched_show_task(cpu_curr(cpu));
 }
+
+module_param(kthreads_pm_level, int, 0664);
