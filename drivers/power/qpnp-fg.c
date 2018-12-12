@@ -9229,10 +9229,16 @@ static int fg_resume(struct device *dev)
 {
 	struct fg_chip *chip = dev_get_drvdata(dev);
 
+    pr_err("fg_resume:%d, %d, %d ,%d\n",get_real_time_prop_value(chip, FG_DATA_CURRENT),
+        		         get_sram_prop_now(chip, FG_DATA_CURRENT),
+                         chip->last_soc,
+                         get_monotonic_soc_raw(chip));
+
 	if (!chip->sw_rbias_ctrl)
 		return 0;
 
 	check_and_update_sram_data(chip);
+
 	return 0;
 }
 
