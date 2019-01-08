@@ -33,12 +33,14 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/proc_fs.h>
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/input.h>
 #include <linux/gpio.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/regulator/consumer.h>
 #include <linux/input/synaptics_dsx_letv.h>
 #include "synaptics_dsx_core.h"
@@ -936,6 +938,52 @@ static struct attribute_group attr_group = {
 	NULL,
  };
 
+static int synaptics_rmi4_proc_init(struct kernfs_node *sysfs_node_parent)
+{
+	int ret = 0;
+	char *buf, *path = NULL;
+	char *double_tap_sysfs_node, *key_disabler_sysfs_node;
+	struct proc_dir_entry *proc_entry_tp = NULL;
+	struct proc_dir_entry *proc_symlink_tmp  = NULL;
+
+	buf = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (buf)
+		path = kernfs_path(sysfs_node_parent, buf, PATH_MAX);
+
+	proc_entry_tp = proc_mkdir("touchpanel", NULL);
+	if (proc_entry_tp == NULL) {
+		ret = -ENOMEM;
+		pr_err("%s: Couldn't create touchpanel\n", __func__);
+	}
+
+	double_tap_sysfs_node = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (double_tap_sysfs_node)
+		sprintf(double_tap_sysfs_node, "/sys%s/%s", path, "wake_gesture");
+	proc_symlink_tmp = proc_symlink("double_tap_enable",
+			proc_entry_tp, double_tap_sysfs_node);
+	if (proc_symlink_tmp == NULL) {
+		ret = -ENOMEM;
+		pr_err("%s: Couldn't create double_tap_enable symlink\n", __func__);
+	}
+
+	key_disabler_sysfs_node = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (key_disabler_sysfs_node)
+		sprintf(key_disabler_sysfs_node, "/sys%s/%s", path, "0dbutton");
+	proc_symlink_tmp = proc_symlink("capacitive_keys_enable",
+			proc_entry_tp, key_disabler_sysfs_node);
+	if (proc_symlink_tmp == NULL) {
+		ret = -ENOMEM;
+		pr_err("%s: Couldn't create capacitive_keys_enable symlink\n", __func__);
+	}
+
+	kfree(buf);
+	kfree(double_tap_sysfs_node);
+	kfree(key_disabler_sysfs_node);
+
+	return ret;
+}
+
+
 static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 		struct synaptics_rmi4_fn *fhandler)
 {
@@ -958,6 +1006,10 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 	int temp;
 	struct synaptics_rmi4_f11_data_1_5 data;
 	struct synaptics_rmi4_f11_extra_data *extra_data;
+
+	dev_dbg(rmi4_data->pdev->dev.parent,
+			"%s: Function %02x reporting\n",
+			__func__, fhandler->fn_number);
 
 	/*
 	 * The number of finger status registers is determined by the
@@ -1134,6 +1186,10 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 #ifdef F12_DATA_15_WORKAROUND
 	static unsigned char objects_already_present;
 #endif
+
+	dev_dbg(rmi4_data->pdev->dev.parent,
+			"%s: Function %02x reporting\n",
+			__func__, fhandler->fn_number);
 
 	fingers_to_process = fhandler->num_of_data_points;
 	data_addr = fhandler->full_addr.data_base;
@@ -1447,6 +1503,10 @@ static void synaptics_rmi4_f1a_report(struct synaptics_rmi4_data *rmi4_data,
 	unsigned short data_addr = fhandler->full_addr.data_base;
 	struct synaptics_rmi4_f1a_handle *f1a = fhandler->data;
 
+	dev_dbg(rmi4_data->pdev->dev.parent,
+			"%s: Function %02x reporting\n",
+			__func__, fhandler->fn_number);
+
 	if (do_once) {
 		memset(current_status, 0, sizeof(current_status));
 #ifdef NO_0D_WHILE_2D
@@ -1481,11 +1541,13 @@ static void synaptics_rmi4_f1a_report(struct synaptics_rmi4_data *rmi4_data,
 		else
 			current_status[button] = status;
 
-		dev_dbg(rmi4_data->pdev->dev.parent,
+		dev_err(rmi4_data->pdev->dev.parent,
 				"%s: Button %d (code %d) ->%d\n",
 				__func__, button,
 				f1a->button_map[button],
 				status);
+
+        if( !rmi4_data->button_0d_enabled ) continue;
 #ifdef NO_0D_WHILE_2D
 		if (rmi4_data->fingers_on_2d == false) {
 			if (status == 1) {
@@ -1672,6 +1734,7 @@ static irqreturn_t synaptics_rmi4_irq(int irq, void *data)
 	if (gpio_get_value(bdata->irq_gpio) != bdata->irq_on_state)
 		goto exit;
 
+    pm_wakeup_event(&rmi4_data->pdev->dev,50);
 	synaptics_rmi4_sensor_report(rmi4_data, true);
 
 exit:
@@ -4203,6 +4266,8 @@ static int synaptics_rmi4_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, rmi4_data);
 
+	device_init_wakeup(&pdev->dev, 1);
+
 	vir_button_map = bdata->vir_button_map;
 
 	retval = synaptics_rmi4_get_reg(rmi4_data, true);
@@ -4338,6 +4403,9 @@ static int synaptics_rmi4_probe(struct platform_device *pdev)
 			goto err_sysfs;
 		}
 	}
+
+    synaptics_rmi4_proc_init(rmi4_data->input_dev->dev.kobj.sd);
+
 	rmi4_data->cdev.name = "touchpanel";
 	rmi4_data->cdev.groups = attr_groups;
 	retval = letv_classdev_register(&pdev->dev,&rmi4_data->cdev);
