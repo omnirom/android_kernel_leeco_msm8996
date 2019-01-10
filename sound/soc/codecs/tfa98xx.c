@@ -10,7 +10,6 @@
  * Free Software Foundation;  either version 2 of the  License, or (at your
  * option) any later version.
  */
-#define DEBUG
 #define pr_fmt(fmt) "%s(): " fmt, __func__
 
 #include <linux/module.h>
@@ -3064,6 +3063,7 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c,
 			tfa98xx->flags |= TFA98XX_FLAG_DSP_START_ON_MUTE;
 			tfa98xx->flags |= TFA98XX_FLAG_SKIP_INTERRUPTS;
 			tfa98xx->flags |= TFA98XX_FLAG_TFA9890_FAM_DEV;
+			tfa98xx->flags |= TFA98XX_FLAG_SAAM_AVAILABLE;
 			break;
 		case 0x92: /* tfa9891 */
 			pr_info("TFA9891 detected\n");
