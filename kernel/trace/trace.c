@@ -2094,6 +2094,7 @@ void trace_printk_init_buffers(void)
 	pr_warning("**                                                      **\n");
 	pr_warning("**   NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE NOTICE   **\n");
 	pr_warning("**********************************************************\n");
+    dump_stack();
 
 	/* Expand the buffers to set size */
 	tracing_update_buffers();
