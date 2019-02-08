@@ -196,6 +196,8 @@ static int devfreq_gpubw_event_handler(struct devfreq *devfreq,
 	int result = 0;
 	unsigned long freq;
 
+    if( devfreq == 0 ) return result;
+
 	mutex_lock(&devfreq->lock);
 	freq = devfreq->previous_freq;
 	switch (event) {
@@ -212,9 +214,11 @@ static int devfreq_gpubw_event_handler(struct devfreq *devfreq,
 	case DEVFREQ_GOV_SUSPEND:
 		{
 			struct devfreq_msm_adreno_tz_data *priv = devfreq->data;
-			priv->bus.total_time = 0;
-			priv->bus.gpu_time = 0;
-			priv->bus.ram_time = 0;
+            if( priv != 0 ) {
+    			priv->bus.total_time = 0;
+    			priv->bus.gpu_time = 0;
+    			priv->bus.ram_time = 0;
+            }
 		}
 		break;
 	default:
